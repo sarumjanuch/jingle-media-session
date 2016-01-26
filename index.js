@@ -58,6 +58,7 @@ function MediaSession(opts) {
     this.pc.on('addStream', this.onAddStream.bind(this));
     this.pc.on('removeStream', this.onRemoveStream.bind(this));
     this.pc.on('addChannel', this.onAddChannel.bind(this));
+    this.pc.on('negotiationNeeded', this.onNegotiationNeeded.bind(this));
 
     if (opts.stream) {
         this.addStream(opts.stream);
@@ -213,6 +214,11 @@ MediaSession.prototype = extend(MediaSession.prototype, {
     // Stream control methods
     // ----------------------------------------------------------------
 
+
+    onNegotiationNeeded: function () {
+        this.emit('NegotiationNeeded');
+    },
+
     addStream: function (stream, renegotiate, cb) {
         var self = this;
 
@@ -254,7 +260,43 @@ MediaSession.prototype = extend(MediaSession.prototype, {
     addStream2: function (stream, cb) {
         this.addStream(stream, true, cb);
     },
+    
+    addStream3: function (stream, cb) {
+        var self = this;
 
+        cb = cb || function () {};
+
+        this.pc.addStream(stream);
+        if(navigator.mozGetUserMedia) {
+            setTimeout(function(){
+                self.emit('NegotiationNeeded');
+            },2000);
+        }
+        this.once('NegotiationNeeded',function(){
+            var self = this;
+            if(navigator.mozGetUserMedia) {
+                offerOptions = {
+                    OfferToReceiveAudio: true,
+                    OfferToReceiveVideo: true
+                    };
+            } else {
+                offerOptions = {};
+                offerOptions.mandatory = {};
+                offerOptions.mandatory.OfferToReceiveAudio = true;
+                offerOptions.mandatory.OfferToReceiveVideo = true;
+            }
+            self.pc.offer(offerOptions, function (err, offer) {
+                if (err) {
+                    self._log('error', 'Could not create WebRTC offer', err);
+                    return self.end('failed-application', true);
+                }
+                offer.jingle.contents.forEach(filterUnusedLabels);
+
+                self.send('source-add', offer.jingle);
+            });
+        });
+    },
+    
     removeStream: function (stream, renegotiate, cb) {
         var self = this;
 
@@ -297,6 +339,31 @@ MediaSession.prototype = extend(MediaSession.prototype, {
 
     removeStream2: function (stream, cb) {
         this.removeStream(stream, true, cb);
+    },
+
+    removeStream3: function(stream, cb){
+        this.pc.removeStream(stream);
+
+        stream.getTracks().forEach(function(track){
+            track.stop();
+        });
+        this.once('NegotiationNeeded',function(){
+            var self = this;
+
+            offerOptions = {};
+            offerOptions.mandatory = {};
+            offerOptions.mandatory.OfferToReceiveAudio = true;
+            offerOptions.mandatory.OfferToReceiveVideo = true;
+            self.pc.offer(offerOptions, function (err, offer) {
+                if (err) {
+                    self._log('error', 'Could not create WebRTC offer', err);
+                    return self.end('failed-application', true);
+                }
+                //offer.jingle.contents.forEach(filterUnusedLabels);
+
+                self.send('source-remove', offer.jingle);
+            });
+        });
     },
 
     switchStream: function (oldStream, newStream, cb) {
@@ -489,32 +556,9 @@ MediaSession.prototype = extend(MediaSession.prototype, {
         var self = this;
         this._log('info', 'Adding new stream source');
 
-        var newDesc = this.pc.remoteDescription;
-        this.pc.remoteDescription.contents.forEach(function (content, idx) {
-            var desc = content.description;
-            var ssrcs = desc.sources || [];
-            var groups = desc.sourceGroups || [];
-
-            changes.contents.forEach(function (newContent) {
-                if (content.name !== newContent.name) {
-                    return;
-                }
-
-                var newContentDesc = newContent.description;
-                var newSSRCs = newContentDesc.sources || [];
-
-                ssrcs = ssrcs.concat(newSSRCs);
-                newDesc.contents[idx].description.sources = JSON.parse(JSON.stringify(ssrcs));
-
-                var newGroups = newContentDesc.sourceGroups || [];
-                groups = groups.concat(newGroups);
-                newDesc.contents[idx].description.sourceGroups = JSON.parse(JSON.stringify(groups));
-            });
-        });
-
         this.pc.handleOffer({
             type: 'offer',
-            jingle: newDesc
+            jingle: changes
         }, function (err) {
             if (err) {
                 self._log('error', 'Error adding new stream source');
@@ -523,13 +567,16 @@ MediaSession.prototype = extend(MediaSession.prototype, {
                 });
             }
 
-            self.pc.answer(function (err) {
+            self.pc.answer(function (err, answer) {
                 if (err) {
                     self._log('error', 'Error adding new stream source');
                     return cb({
                         condition: 'general-error'
                     });
                 }
+                answer.jingle.contents.forEach(filterUnusedLabels);
+
+                self.send('session-accept', answer.jingle);
                 cb();
             });
         });
@@ -539,68 +586,9 @@ MediaSession.prototype = extend(MediaSession.prototype, {
         var self = this;
         this._log('info', 'Removing stream source');
 
-        var newDesc = this.pc.remoteDescription;
-        this.pc.remoteDescription.contents.forEach(function (content, idx) {
-            var desc = content.description;
-            var ssrcs = desc.sources || [];
-            var groups = desc.sourceGroups || [];
-
-            changes.contents.forEach(function (newContent) {
-                if (content.name !== newContent.name) {
-                    return;
-                }
-
-                var newContentDesc = newContent.description;
-                var newSSRCs = newContentDesc.sources || [];
-                var newGroups = newContentDesc.sourceGroups || [];
-
-                var found, i, j, k;
-
-
-                for (i = 0; i < newSSRCs.length; i++) {
-                    found = -1;
-                    for (j = 0; j < ssrcs.length; j++) {
-                        if (newSSRCs[i].ssrc === ssrcs[j].ssrc) {
-                            found = j;
-                            break;
-                        }
-                    }
-                    if (found > -1) {
-                        ssrcs.splice(found, 1);
-                        newDesc.contents[idx].description.sources = JSON.parse(JSON.stringify(ssrcs));
-                    }
-                }
-
-                // Remove ssrc-groups that are no longer needed
-                for (i = 0; i < newGroups.length; i++) {
-                    found = -1;
-                    for (j = 0; j < groups.length; j++) {
-                        if (newGroups[i].semantics === groups[j].semantics &&
-                            newGroups[i].sources.length === groups[j].sources.length) {
-                            var same = true;
-                            for (k = 0; k < newGroups[i].sources.length; k++) {
-                                if (newGroups[i].sources[k] !== groups[j].sources[k]) {
-                                    same = false;
-                                    break;
-                                }
-                            }
-                            if (same) {
-                                found = j;
-                                break;
-                            }
-                        }
-                    }
-                    if (found > -1) {
-                        groups.splice(found, 1);
-                        newDesc.contents[idx].description.sourceGroups = JSON.parse(JSON.stringify(groups));
-                    }
-                }
-            });
-        });
-
         this.pc.handleOffer({
             type: 'offer',
-            jingle: newDesc
+            jingle: changes
         }, function (err) {
             if (err) {
                 self._log('error', 'Error removing stream source');
@@ -608,13 +596,14 @@ MediaSession.prototype = extend(MediaSession.prototype, {
                     condition: 'general-error'
                 });
             }
-            self.pc.answer(function (err) {
+            self.pc.answer(function (err, answer) {
                 if (err) {
                     self._log('error', 'Error removing stream source');
                     return cb({
                         condition: 'general-error'
                     });
                 }
+                self.send('session-accept', answer.jingle);
                 cb();
             });
         });
